@@ -6,13 +6,20 @@ Read `context.md` first for current state and decisions.
 
 ## Invariants (do not break)
 
-1. Never delete user files — not in sync, not in restore, not in prune of
-   session trees. Only `~/.meld/backups` snapshots may be pruned.
-2. Never overwrite an existing session file. Same relative path + different
-   hash = conflict, surfaced to the user, both variants kept.
+1. Only delete a session file to mirror a deletion Claude made in another
+   account (`propagate_deletes`, opt-in, off by default): write the `deleted_<chat>` marker the way
+   Claude does, then remove `local_<chat>.json`. Restore may remove deletion
+   markers to un-delete. Nothing else is ever deleted from session trees.
+2. Only overwrite a session file with a strictly newer copy of the same
+   conversation (`propagate_updates`, opt-in, off by default). Equal mtimes + different content =
+   conflict, surfaced to the user, both variants kept. Skip any target whose
+   size/mtime moved since the scan.
 3. Every write is temp-file + fsync + rename (`.meld-tmp` suffix — the
    watcher ignores that suffix to avoid feedback loops).
-4. `meld sync` snapshots all trees before its first write unless `--no-backup`.
+4. `meld sync` snapshots before its first write unless `--no-backup`: all
+   trees for a copy-only sync, or exactly the files it replaces or deletes
+   when full sync is on. A restore snapshots the files it replaces or
+   removes first, so it can be undone.
 5. Content decides identity, not folder names. The sync key is the path
    relative to the account root; equality is sha256.
 6. Never decrypt Claude's OAuth token or read Keychain secrets to show
@@ -28,8 +35,11 @@ Read `context.md` first for current state and decisions.
   relative path. `src/accounts.rs` builds the account→org fingerprint used
   by `meld accounts` and `meld status` (counts, last-active, top cwd paths —
   never email/org name, see invariant 6).
-- Pipeline: `discover` (account roots) → `scan` (walk+hash, reuses hashes when
-  size+mtime unchanged) → `diff` (union-mirror plan) → `sync` (apply).
+- Pipeline: `discover` (account roots) → `scan` (walk+hash `local_*.json`,
+  collect `deleted_*` markers; reuses hashes when size+mtime unchanged) →
+  `diff` (copy / update / delete plan) → `sync` (apply). Other files in the
+  trees (e.g. `scheduled-tasks.json`) are per-account and never synced.
+- `service` installs `meld watch` as the `com.meld.watch` LaunchAgent (macOS).
 - `watch` re-runs the whole pipeline after a debounced event burst.
 - State in `~/.meld/` (`config.toml`, `manifest.json`, `backups/`, `meld.lock`).
 - Cross-platform (macOS + Windows): session-root default is per-OS in

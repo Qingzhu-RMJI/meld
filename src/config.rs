@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 /// Meld configuration. Lives at ~/.meld/config.toml; every field has a
 /// sensible default so the tool works with no config file at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// Parent directory that contains one folder per account.
     pub sessions_root: PathBuf,
@@ -17,6 +18,19 @@ pub struct Config {
     pub max_snapshots: usize,
     /// File name patterns to ignore (exact basename match).
     pub ignore: Vec<String>,
+    /// Opt-in: a conversation deleted in one account is deleted in every
+    /// account.
+    pub propagate_deletes: bool,
+    /// Opt-in: when accounts hold different versions of a conversation, the
+    /// newest copy replaces the older ones (the replaced copies are backed up).
+    pub propagate_updates: bool,
+}
+
+/// The parts of the config that decide what a sync does.
+#[derive(Debug, Clone, Copy)]
+pub struct Policy {
+    pub propagate_deletes: bool,
+    pub propagate_updates: bool,
 }
 
 impl Default for Config {
@@ -25,8 +39,10 @@ impl Default for Config {
             sessions_root: default_sessions_root(),
             state_dir: home_dir().join(".meld"),
             debounce_ms: 1500,
-            max_snapshots: 10,
+            max_snapshots: 200,
             ignore: vec![".DS_Store".into(), "desktop.ini".into(), "Thumbs.db".into()],
+            propagate_deletes: false,
+            propagate_updates: false,
         }
     }
 }
@@ -89,6 +105,13 @@ impl Config {
         let cfg = Config::default();
         std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
         Ok(path)
+    }
+
+    pub fn policy(&self) -> Policy {
+        Policy {
+            propagate_deletes: self.propagate_deletes,
+            propagate_updates: self.propagate_updates,
+        }
     }
 
     pub fn manifest_path(&self) -> PathBuf {

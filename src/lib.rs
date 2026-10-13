@@ -11,5 +11,6 @@ pub mod logging;
 pub mod manifest;
 pub mod restore;
 pub mod scan;
+pub mod service;
 pub mod sync;
 pub mod watch;

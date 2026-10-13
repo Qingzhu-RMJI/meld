@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::errors::Result;
 use crate::hash::sha256_file;
 use crate::logging;
-use crate::manifest::{FileEntry, Manifest};
+use crate::manifest::{FileEntry, Manifest, Tombstone};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -17,6 +17,8 @@ const WRITE_QUIET_SECS: i64 = 2;
 pub fn scan(cfg: &Config, roots: &[PathBuf], previous: &Manifest) -> Result<Manifest> {
     let now = Utc::now();
     let mut entries = Vec::new();
+    let mut tombstones = Vec::new();
+    let mut skipped_recent = 0usize;
 
     for root in roots {
         for item in WalkDir::new(root).follow_links(false) {
@@ -34,9 +36,9 @@ pub fn scan(cfg: &Config, roots: &[PathBuf], previous: &Manifest) -> Result<Mani
             if cfg.is_ignored(path) {
                 continue;
             }
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            let Some(kind) = file_kind(path) else {
                 continue;
-            }
+            };
             let meta = match item.metadata() {
                 Ok(m) => m,
                 Err(e) => {
@@ -51,7 +53,21 @@ pub fn scan(cfg: &Config, roots: &[PathBuf], previous: &Manifest) -> Result<Mani
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
+            if kind == FileKind::Tombstone {
+                let rel = path.strip_prefix(root)?;
+                if let Some(session_path) = tombstone_session_path(rel) {
+                    tombstones.push(Tombstone {
+                        account_root: root.clone(),
+                        file_path: path.to_path_buf(),
+                        session_path,
+                        mtime,
+                    });
+                }
+                continue;
+            }
+
             if now.timestamp() - mtime < WRITE_QUIET_SECS {
+                skipped_recent += 1;
                 logging::verbose(&format!(
                     "skipping (recently written): {}",
                     path.display()
@@ -105,7 +121,43 @@ pub fn scan(cfg: &Config, roots: &[PathBuf], previous: &Manifest) -> Result<Mani
         sessions_root: cfg.sessions_root.clone(),
         account_roots: roots.to_vec(),
         entries,
+        tombstones,
+        skipped_recent,
     })
+}
+
+#[derive(Debug, PartialEq)]
+enum FileKind {
+    Session,
+    Tombstone,
+}
+
+/// Only conversation files (`local_<chat>.json`) and Claude's deletion
+/// markers (`deleted_<chat>`, no extension) take part in sync. Other
+/// per-account files such as `scheduled-tasks.json` stay where they are.
+fn file_kind(path: &Path) -> Option<FileKind> {
+    let name = path.file_name()?.to_str()?;
+    if name.starts_with("local_") && name.ends_with(".json") {
+        Some(FileKind::Session)
+    } else if name.starts_with("deleted_") && path.extension().is_none() {
+        Some(FileKind::Tombstone)
+    } else {
+        None
+    }
+}
+
+/// `<org>/deleted_<chat>` -> `<org>/local_<chat>.json`
+pub fn tombstone_session_path(rel: &Path) -> Option<PathBuf> {
+    let name = rel.file_name()?.to_str()?;
+    let id = name.strip_prefix("deleted_")?;
+    Some(rel.with_file_name(format!("local_{id}.json")))
+}
+
+/// `<org>/local_<chat>.json` -> `<org>/deleted_<chat>`
+pub fn session_tombstone_path(rel: &Path) -> Option<PathBuf> {
+    let name = rel.file_name()?.to_str()?;
+    let id = name.strip_prefix("local_")?.strip_suffix(".json")?;
+    Some(rel.with_file_name(format!("deleted_{id}")))
 }
 
 /// Bookkeeping fields Claude Code rewrites every time a session is merely

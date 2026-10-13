@@ -35,6 +35,19 @@ pub struct FileEntry {
     pub last_seen_at: String,
 }
 
+/// A `deleted_<chat>` marker: Claude writes one (containing the deletion
+/// time) in place of `local_<chat>.json` when a conversation is deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Tombstone {
+    pub account_root: PathBuf,
+    /// Absolute path of the marker file.
+    pub file_path: PathBuf,
+    /// Relative path of the session file this marker stands for
+    /// (`<org>/local_<chat>.json`) — the same sync key as `FileEntry`.
+    pub session_path: PathBuf,
+    pub mtime: i64,
+}
+
 /// The persisted view of every discovered tree.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
@@ -42,6 +55,12 @@ pub struct Manifest {
     pub sessions_root: PathBuf,
     pub account_roots: Vec<PathBuf>,
     pub entries: Vec<FileEntry>,
+    #[serde(default)]
+    pub tombstones: Vec<Tombstone>,
+    /// Files skipped by this scan because they were still being written;
+    /// a watcher should rescan shortly even if no new event arrives.
+    #[serde(skip)]
+    pub skipped_recent: usize,
 }
 
 impl Manifest {

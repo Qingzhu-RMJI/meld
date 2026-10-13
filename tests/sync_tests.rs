@@ -1,13 +1,24 @@
-use meld::{config::Config, diff, discover, manifest::Manifest, scan, sync};
+use meld::{backup, config::Config, diff, discover, manifest::Manifest, restore, scan, sync};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+/// Full sync (both opt-in policies on); tests for the copy-only default
+/// turn them off explicitly.
 fn test_config(root: &Path, state: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.sessions_root = root.to_path_buf();
     cfg.state_dir = state.to_path_buf();
+    cfg.propagate_deletes = true;
+    cfg.propagate_updates = true;
     cfg
+}
+
+#[test]
+fn full_sync_is_opt_in() {
+    let cfg = Config::default();
+    assert!(!cfg.propagate_deletes);
+    assert!(!cfg.propagate_updates);
 }
 
 fn write_session(root: &Path, account: &str, ws: &str, session: &str, body: &str) {
@@ -19,17 +30,33 @@ fn write_session(root: &Path, account: &str, ws: &str, session: &str, body: &str
     backdate(&path);
 }
 
+/// Delete a session the way Claude does: drop a `deleted_<id>` marker
+/// holding the deletion time, then remove the session file.
+fn delete_session(root: &Path, account: &str, ws: &str, session: &str) {
+    let dir = root.join(account).join(ws);
+    fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join(format!("deleted_{session}"));
+    fs::write(&marker, "1791788350585").unwrap();
+    set_mtime(&marker, 1_600_000_000);
+    let _ = fs::remove_file(dir.join(format!("local_{session}.json")));
+}
+
 fn backdate(path: &Path) {
-    use std::process::Command;
-    Command::new("touch")
-        .args(["-t", "202001010000", path.to_str().unwrap()])
-        .status()
-        .unwrap();
+    set_mtime(path, 1_577_836_800); // 2020-01-01
+}
+
+fn set_mtime(path: &Path, secs: i64) {
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, 0)).unwrap();
 }
 
 fn scan_all(cfg: &Config) -> Manifest {
     let roots = discover::discover_account_roots(cfg).unwrap();
     scan::scan(cfg, &roots, &Manifest::default()).unwrap()
+}
+
+fn sync_all(cfg: &Config) -> sync::SyncOutcome {
+    let report = diff::compute(&scan_all(cfg), cfg.policy());
+    sync::apply(cfg, &report, false, false).unwrap()
 }
 
 #[test]
@@ -47,11 +74,11 @@ fn union_mirror_copies_missing_files_both_ways() {
     let m = scan_all(&cfg);
     assert_eq!(m.entries.len(), 2);
 
-    let report = diff::compute(&m);
+    let report = diff::compute(&m, cfg.policy());
     assert_eq!(report.copies.len(), 2, "each account is missing one file");
     assert!(report.conflicts.is_empty());
 
-    let out = sync::apply(&cfg, &report, &roots, false, true).unwrap();
+    let out = sync::apply(&cfg, &report, false, true).unwrap();
     assert_eq!(out.copied, 2);
 
     assert!(root.join("acct-a/ws1/local_y.json").exists());
@@ -68,16 +95,15 @@ fn sync_is_idempotent() {
     let root = tmp.path();
     write_session(root, "acct-a", "ws1", "x", r#"{"sessionId":"x"}"#);
     write_session(root, "acct-b", "ws1", "y", r#"{"sessionId":"y"}"#);
+    delete_session(root, "acct-a", "ws1", "z");
+    write_session(root, "acct-b", "ws1", "z", r#"{"sessionId":"z"}"#);
 
     let cfg = test_config(root, state.path());
-    let roots = discover::discover_account_roots(&cfg).unwrap();
-
-    let report = diff::compute(&scan_all(&cfg));
-    sync::apply(&cfg, &report, &roots, false, true).unwrap();
+    sync_all(&cfg);
 
     // Copied files inherit source mtime, so no re-backdating is needed.
-    let report2 = diff::compute(&scan_all(&cfg));
-    assert!(report2.copies.is_empty(), "second sync should be a no-op");
+    let report2 = diff::compute(&scan_all(&cfg), cfg.policy());
+    assert!(report2.is_empty(), "second sync should be a no-op");
 }
 
 #[test]
@@ -87,37 +113,171 @@ fn dry_run_writes_nothing() {
     let root = tmp.path();
     write_session(root, "acct-a", "ws1", "x", r#"{"sessionId":"x"}"#);
     write_session(root, "acct-b", "ws1", "y", r#"{"sessionId":"y"}"#);
+    delete_session(root, "acct-a", "ws1", "z");
+    write_session(root, "acct-b", "ws1", "z", r#"{"sessionId":"z"}"#);
 
     let cfg = test_config(root, state.path());
-    let roots = discover::discover_account_roots(&cfg).unwrap();
-    let report = diff::compute(&scan_all(&cfg));
+    let report = diff::compute(&scan_all(&cfg), cfg.policy());
 
-    sync::apply(&cfg, &report, &roots, true, true).unwrap();
+    sync::apply(&cfg, &report, true, true).unwrap();
     assert!(!root.join("acct-a/ws1/local_y.json").exists());
     assert!(!root.join("acct-b/ws1/local_x.json").exists());
+    assert!(root.join("acct-b/ws1/local_z.json").exists());
+    assert!(backup::list_snapshots(&cfg).unwrap().is_empty());
 }
 
 #[test]
-fn existing_files_are_never_overwritten() {
+fn newest_version_replaces_older_copies() {
     let tmp = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     let root = tmp.path();
-    // Same relative path, different content in each account: conflict.
+    write_session(root, "acct-a", "ws1", "x", r#"{"sessionId":"x","v":1}"#);
+    write_session(root, "acct-b", "ws1", "x", r#"{"sessionId":"x","v":2}"#);
+    set_mtime(&root.join("acct-b/ws1/local_x.json"), 1_600_000_000); // newer
+
+    let cfg = test_config(root, state.path());
+    let report = diff::compute(&scan_all(&cfg), cfg.policy());
+    assert_eq!(report.updates.len(), 1);
+    assert!(report.conflicts.is_empty());
+
+    let out = sync::apply(&cfg, &report, false, false).unwrap();
+    assert_eq!(out.updated, 1);
+    let a = fs::read_to_string(root.join("acct-a/ws1/local_x.json")).unwrap();
+    assert!(a.contains(r#""v":2"#), "older copy replaced by newest");
+
+    // The replaced copy is in the backup.
+    let snap = out.snapshot.expect("backup taken before overwrite");
+    let saved = fs::read_to_string(snap.join("acct-a/ws1/local_x.json")).unwrap();
+    assert!(saved.contains(r#""v":1"#));
+}
+
+#[test]
+fn volatile_field_drift_is_not_an_update() {
+    let tmp = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_session(root, "acct-a", "ws1", "x", r#"{"sessionId":"x","lastFocusedAt":1}"#);
+    write_session(root, "acct-b", "ws1", "x", r#"{"sessionId":"x","lastFocusedAt":2}"#);
+    set_mtime(&root.join("acct-b/ws1/local_x.json"), 1_600_000_000);
+
+    let cfg = test_config(root, state.path());
+    let report = diff::compute(&scan_all(&cfg), cfg.policy());
+    assert!(report.is_empty());
+    assert!(report.conflicts.is_empty());
+}
+
+#[test]
+fn same_mtime_different_content_is_a_conflict() {
+    let tmp = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = tmp.path();
     write_session(root, "acct-a", "ws1", "x", r#"{"sessionId":"x","v":1}"#);
     write_session(root, "acct-b", "ws1", "x", r#"{"sessionId":"x","v":2}"#);
 
     let cfg = test_config(root, state.path());
-    let roots = discover::discover_account_roots(&cfg).unwrap();
-    let report = diff::compute(&scan_all(&cfg));
+    let report = diff::compute(&scan_all(&cfg), cfg.policy());
+    assert_eq!(report.conflicts.len(), 1);
+    assert!(report.updates.is_empty(), "no strictly-newest copy; keep both");
+}
+
+#[test]
+fn existing_files_are_never_overwritten_when_updates_are_off() {
+    let tmp = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_session(root, "acct-a", "ws1", "x", r#"{"sessionId":"x","v":1}"#);
+    write_session(root, "acct-b", "ws1", "x", r#"{"sessionId":"x","v":2}"#);
+    set_mtime(&root.join("acct-b/ws1/local_x.json"), 1_600_000_000);
+
+    let mut cfg = test_config(root, state.path());
+    cfg.propagate_updates = false;
+    let report = diff::compute(&scan_all(&cfg), cfg.policy());
 
     assert_eq!(report.conflicts.len(), 1);
-    assert!(report.copies.is_empty(), "both trees have the path; no copy");
+    assert!(report.is_empty(), "both trees have the path; no change");
 
-    sync::apply(&cfg, &report, &roots, false, true).unwrap();
+    sync::apply(&cfg, &report, false, true).unwrap();
     let a = fs::read_to_string(root.join("acct-a/ws1/local_x.json")).unwrap();
     let b = fs::read_to_string(root.join("acct-b/ws1/local_x.json")).unwrap();
     assert!(a.contains(r#""v":1"#));
     assert!(b.contains(r#""v":2"#));
+}
+
+#[test]
+fn deletion_in_one_account_deletes_everywhere() {
+    let tmp = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = tmp.path();
+    delete_session(root, "acct-a", "ws1", "x");
+    write_session(root, "acct-b", "ws1", "x", r#"{"sessionId":"x"}"#);
+    write_session(root, "acct-c", "ws1", "x", r#"{"sessionId":"x"}"#);
+
+    let cfg = test_config(root, state.path());
+    let out = sync_all(&cfg);
+    assert_eq!(out.deleted, 2);
+    assert_eq!(out.copied, 0, "a deleted conversation is never copied back");
+
+    for acct in ["acct-a", "acct-b", "acct-c"] {
+        assert!(!root.join(acct).join("ws1/local_x.json").exists());
+        assert!(root.join(acct).join("ws1/deleted_x").exists(), "{acct} has the marker");
+    }
+    // Deleted copies are in the backup.
+    let snap = out.snapshot.unwrap();
+    assert!(snap.join("acct-b/ws1/local_x.json").exists());
+    assert!(snap.join("acct-c/ws1/local_x.json").exists());
+}
+
+#[test]
+fn deletes_are_kept_local_when_turned_off() {
+    let tmp = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = tmp.path();
+    delete_session(root, "acct-a", "ws1", "x");
+    write_session(root, "acct-b", "ws1", "x", r#"{"sessionId":"x"}"#);
+
+    let mut cfg = test_config(root, state.path());
+    cfg.propagate_deletes = false;
+    let report = diff::compute(&scan_all(&cfg), cfg.policy());
+    assert!(report.deletes.is_empty());
+    sync::apply(&cfg, &report, false, true).unwrap();
+    assert!(root.join("acct-b/ws1/local_x.json").exists());
+}
+
+#[test]
+fn non_session_files_are_not_synced() {
+    let tmp = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_session(root, "acct-a", "ws1", "x", r#"{"sessionId":"x"}"#);
+    let tasks = root.join("acct-a/ws1/scheduled-tasks.json");
+    fs::write(&tasks, "[]").unwrap();
+    backdate(&tasks);
+    fs::create_dir_all(root.join("acct-b")).unwrap();
+
+    let cfg = test_config(root, state.path());
+    sync_all(&cfg);
+    assert!(root.join("acct-b/ws1/local_x.json").exists());
+    assert!(!root.join("acct-b/ws1/scheduled-tasks.json").exists());
+}
+
+#[test]
+fn restore_undoes_a_propagated_deletion() {
+    let tmp = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = tmp.path();
+    delete_session(root, "acct-a", "ws1", "x");
+    write_session(root, "acct-b", "ws1", "x", r#"{"sessionId":"x"}"#);
+
+    let cfg = test_config(root, state.path());
+    sync_all(&cfg);
+    assert!(!root.join("acct-b/ws1/local_x.json").exists());
+
+    restore::restore(&cfg, None, false).unwrap();
+    assert!(root.join("acct-b/ws1/local_x.json").exists());
+    assert!(!root.join("acct-a/ws1/deleted_x").exists(), "un-deleted everywhere");
+    assert!(!root.join("acct-b/ws1/deleted_x").exists());
+    // The restore itself was backed up first, so it can be undone too.
+    assert_eq!(backup::list_snapshots(&cfg).unwrap().len(), 2);
 }
 
 #[test]
@@ -134,8 +294,8 @@ fn new_account_folder_is_filled_on_next_sync() {
     let roots = discover::discover_account_roots(&cfg).unwrap();
     assert_eq!(roots.len(), 2);
 
-    let report = diff::compute(&scan_all(&cfg));
+    let report = diff::compute(&scan_all(&cfg), cfg.policy());
     assert_eq!(report.copies.len(), 1);
-    sync::apply(&cfg, &report, &roots, false, true).unwrap();
+    sync::apply(&cfg, &report, false, true).unwrap();
     assert!(root.join("acct-new/ws1/local_x.json").exists());
 }

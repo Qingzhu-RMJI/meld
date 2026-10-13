@@ -29,7 +29,8 @@ pub enum Command {
     Status,
     /// Show per-account differences (what sync would copy)
     Diff,
-    /// Mirror missing session files into every account tree
+    /// Make every account hold the same conversations: copy new ones,
+    /// spread the newest version, and delete what was deleted elsewhere
     Sync {
         /// Show what would happen without writing anything
         #[arg(long)]
@@ -49,11 +50,19 @@ pub enum Command {
     Backup,
     /// Roll back from a snapshot (newest by default)
     Restore {
-        /// Snapshot name (see `meld backup` output / ~/.meld/backups)
+        /// Snapshot name (see `meld restore --list`)
         #[arg(long)]
         snapshot: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        /// List available snapshots instead of restoring
+        #[arg(long)]
+        list: bool,
+    },
+    /// Run `meld watch` in the background at login (macOS)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
     /// Check paths, permissions and index health
     Doctor,
@@ -62,6 +71,16 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServiceAction {
+    /// Start background sync now and at every login
+    Install,
+    /// Stop background sync and remove it from login
+    Uninstall,
+    /// Show whether background sync is running
+    Status,
 }
 
 #[derive(Subcommand, Debug)]

@@ -38,7 +38,32 @@ pub fn snapshot(cfg: &Config, roots: &[PathBuf]) -> Result<PathBuf> {
         "Backup saved ({copied} files). You can undo changes any time with `meld restore`."
     ));
     logging::verbose(&format!("backup location: {}", dest.display()));
-    prune(cfg)?;
+    prune(cfg, None)?;
+    Ok(dest)
+}
+
+/// Snapshot just the given files (absolute paths under the sessions root)
+/// — the ones a sync or restore is about to replace or remove. `keep` is a
+/// snapshot that pruning must not touch (the one being restored from).
+pub fn snapshot_files(cfg: &Config, files: &[PathBuf], keep: Option<&Path>) -> Result<PathBuf> {
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
+    let dest = cfg.backups_dir().join(&stamp);
+    std::fs::create_dir_all(&dest)?;
+
+    for path in files {
+        if !path.exists() {
+            continue;
+        }
+        let rel = path.strip_prefix(&cfg.sessions_root)?;
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(path, &target)
+            .with_context(|| format!("backing up {}", path.display()))?;
+    }
+    logging::verbose(&format!("backup location: {}", dest.display()));
+    prune(cfg, keep)?;
     Ok(dest)
 }
 
@@ -56,11 +81,14 @@ pub fn list_snapshots(cfg: &Config) -> Result<Vec<PathBuf>> {
     Ok(snaps)
 }
 
-/// Keep only the newest `max_snapshots`.
-fn prune(cfg: &Config) -> Result<()> {
+/// Keep only the newest `max_snapshots` (never pruning `keep`).
+fn prune(cfg: &Config, keep: Option<&Path>) -> Result<()> {
     let snaps = list_snapshots(cfg)?;
     if snaps.len() > cfg.max_snapshots {
         for old in &snaps[..snaps.len() - cfg.max_snapshots] {
+            if Some(old.as_path()) == keep {
+                continue;
+            }
             logging::verbose(&format!("pruning old snapshot {}", old.display()));
             std::fs::remove_dir_all(old)?;
         }

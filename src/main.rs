@@ -1,7 +1,7 @@
-use meld::{accounts, backup, cli, config, diff, discover, errors, lock, logging, manifest, restore, scan, sync, watch};
+use meld::{accounts, backup, cli, config, diff, discover, errors, lock, logging, manifest, restore, scan, service, sync, watch};
 
 use clap::Parser;
-use cli::{Cli, Command, ConfigAction};
+use cli::{Cli, Command, ConfigAction, ServiceAction};
 use config::Config;
 use errors::Result;
 use manifest::Manifest;
@@ -44,7 +44,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Status => {
             let m = do_scan(&cfg)?;
-            let report = diff::compute(&m);
+            let report = diff::compute(&m, cfg.policy());
             if cli.json {
                 print_status_json(&m, &report)?;
             } else {
@@ -53,7 +53,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Diff => {
             let m = do_scan(&cfg)?;
-            let report = diff::compute(&m);
+            let report = diff::compute(&m, cfg.policy());
             if cli.json {
                 print_status_json(&m, &report)?;
             } else {
@@ -64,8 +64,8 @@ fn run(cli: Cli) -> Result<()> {
             let _lock = lock::Lock::acquire(&cfg)?;
             let roots = discover::discover_account_roots(&cfg)?;
             let m = do_scan(&cfg)?;
-            let report = diff::compute(&m);
-            sync::apply(&cfg, &report, &roots, dry_run, no_backup)?;
+            let report = diff::compute(&m, cfg.policy());
+            sync::apply(&cfg, &report, dry_run, no_backup)?;
             if !dry_run {
                 let m2 = scan::scan(&cfg, &roots, &m)?;
                 m2.save(&cfg.manifest_path())?;
@@ -79,10 +79,14 @@ fn run(cli: Cli) -> Result<()> {
             let roots = discover::discover_account_roots(&cfg)?;
             backup::snapshot(&cfg, &roots)?;
         }
-        Command::Restore { snapshot, dry_run } => {
+        Command::Restore { list: true, .. } => restore::list(&cfg)?,
+        Command::Restore { snapshot, dry_run, .. } => {
             let _lock = lock::Lock::acquire(&cfg)?;
             restore::restore(&cfg, snapshot.as_deref(), dry_run)?;
         }
+        Command::Service { action: ServiceAction::Install } => service::install()?,
+        Command::Service { action: ServiceAction::Uninstall } => service::uninstall()?,
+        Command::Service { action: ServiceAction::Status } => service::status()?,
         Command::Doctor => doctor(&cfg)?,
     }
     Ok(())
@@ -176,12 +180,14 @@ fn print_status(m: &Manifest, report: &diff::DiffReport) {
     }
     println!("\n(Run `meld accounts` for more detail on each one.)");
     println!();
-    if report.copies.is_empty() {
+    if report.is_empty() {
         println!("All accounts are up to date.");
     } else {
         println!(
-            "{} waiting to sync. Run `meld sync` to update all accounts.",
-            sync::conversations(report.copies.len())
+            "Waiting to sync: {} to copy, {} to update, {} to delete. Run `meld sync` to update all accounts.",
+            report.copies.len(),
+            report.updates.len(),
+            report.deletes.len()
         );
     }
     if !report.conflicts.is_empty() {
@@ -202,24 +208,35 @@ fn print_status(m: &Manifest, report: &diff::DiffReport) {
 }
 
 fn print_diff(report: &diff::DiffReport) {
-    if report.copies.is_empty() {
+    if report.is_empty() {
         println!("Nothing to sync — every account has the same conversations.");
         return;
     }
-    // Group pending copies by destination account.
-    let mut by_dest: std::collections::BTreeMap<&std::path::Path, Vec<&diff::CopyAction>> =
+    // Group pending changes by the account they land in.
+    let mut by_dest: std::collections::BTreeMap<&std::path::Path, Vec<String>> =
         std::collections::BTreeMap::new();
     for c in &report.copies {
-        by_dest.entry(c.dest_root.as_path()).or_default().push(c);
+        by_dest
+            .entry(c.dest_root.as_path())
+            .or_default()
+            .push(format!("+ copy    {}", sync::describe(&c.source)));
     }
-    for (dest, copies) in by_dest {
-        println!(
-            "{} will receive {}:",
-            account_label(dest),
-            sync::conversations(copies.len())
-        );
-        for c in copies {
-            println!("  - {}", sync::describe(&c.source));
+    for u in &report.updates {
+        by_dest
+            .entry(u.target.account_root.as_path())
+            .or_default()
+            .push(format!("~ update  {}", sync::describe(&u.source)));
+    }
+    for d in &report.deletes {
+        by_dest
+            .entry(d.target.account_root.as_path())
+            .or_default()
+            .push(format!("- delete  {}", sync::describe(&d.target)));
+    }
+    for (dest, lines) in by_dest {
+        println!("{}:", account_label(dest));
+        for l in lines {
+            println!("  {l}");
         }
     }
     println!("\nRun `meld sync` to apply, or `meld sync --dry-run` to preview again.");
@@ -233,6 +250,14 @@ fn print_status_json(m: &Manifest, report: &diff::DiffReport) -> Result<()> {
         "pending_copies": report.copies.iter().map(|c| serde_json::json!({
             "relative_path": c.source.relative_path,
             "dest_root": c.dest_root,
+        })).collect::<Vec<_>>(),
+        "pending_updates": report.updates.iter().map(|u| serde_json::json!({
+            "relative_path": u.target.relative_path,
+            "dest_root": u.target.account_root,
+        })).collect::<Vec<_>>(),
+        "pending_deletes": report.deletes.iter().map(|d| serde_json::json!({
+            "relative_path": d.target.relative_path,
+            "dest_root": d.target.account_root,
         })).collect::<Vec<_>>(),
         "conflicts": report.conflicts.iter().map(|c| serde_json::json!({
             "relative_path": c.relative_path,

@@ -3,8 +3,12 @@ use crate::errors::Result;
 use crate::logging;
 use crate::{diff, discover, manifest::Manifest, scan, sync};
 use notify::{RecursiveMode, Watcher};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
+
+/// How long to wait before looking again at files that were still being
+/// written during the last cycle (just past scan's quiet window).
+const RECHECK_SECS: u64 = 3;
 
 /// Watch the sessions root (recursively, so brand-new account folders are
 /// picked up too) and run scan+sync after each debounced burst of events.
@@ -35,11 +39,17 @@ pub fn watch(cfg: &Config, dry_run: bool, no_backup: bool) -> Result<()> {
     ));
 
     // Initial pass so a fresh `meld watch` converges immediately.
-    run_cycle(cfg, dry_run, no_backup)?;
+    let mut recheck = run_cycle(cfg, dry_run, no_backup)?;
 
     loop {
-        // Block until something changes...
-        if rx.recv().is_err() {
+        // Block until something changes — or, if the last cycle had to skip
+        // files that were mid-write, until it's time to look at them again.
+        if recheck {
+            match rx.recv_timeout(Duration::from_secs(RECHECK_SECS)) {
+                Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else if rx.recv().is_err() {
             break;
         }
         // ...then drain further events until things go quiet (debounce).
@@ -47,25 +57,29 @@ pub fn watch(cfg: &Config, dry_run: bool, no_backup: bool) -> Result<()> {
             .recv_timeout(Duration::from_millis(cfg.debounce_ms))
             .is_ok()
         {}
-        if let Err(e) = run_cycle(cfg, dry_run, no_backup) {
-            logging::warn(&format!("sync cycle failed: {e:#}"));
-        }
+        recheck = match run_cycle(cfg, dry_run, no_backup) {
+            Ok(r) => r,
+            Err(e) => {
+                logging::warn(&format!("sync cycle failed: {e:#}"));
+                false
+            }
+        };
     }
     Ok(())
 }
 
-fn run_cycle(cfg: &Config, dry_run: bool, no_backup: bool) -> Result<()> {
+/// One scan+sync pass. Returns true when some files were skipped because
+/// they were still being written.
+fn run_cycle(cfg: &Config, dry_run: bool, no_backup: bool) -> Result<bool> {
     let roots = discover::discover_account_roots(cfg)?;
     let previous = Manifest::load_or_default(&cfg.manifest_path());
-    let m = scan::scan(cfg, &roots, &previous)?;
-    let report = diff::compute(&m);
-    if !report.copies.is_empty() {
-        sync::apply(cfg, &report, &roots, dry_run, no_backup)?;
+    let mut m = scan::scan(cfg, &roots, &previous)?;
+    let report = diff::compute(&m, cfg.policy());
+    if !report.is_empty() {
+        sync::apply(cfg, &report, dry_run, no_backup)?;
         // Rescan after writing so the manifest reflects reality.
-        let m = scan::scan(cfg, &roots, &m)?;
-        m.save(&cfg.manifest_path())?;
-    } else {
-        m.save(&cfg.manifest_path())?;
+        m = scan::scan(cfg, &roots, &m)?;
     }
-    Ok(())
+    m.save(&cfg.manifest_path())?;
+    Ok(m.skipped_recent > 0)
 }
